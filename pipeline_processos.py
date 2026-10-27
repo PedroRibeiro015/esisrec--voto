@@ -53,6 +53,8 @@ nele normalmente; o robô começa sozinho assim que aparece a tela de unidade ou
 O login fica salvo nesse perfil para as próximas vezes.
 Depois do login, o robô espera você abrir a página do Relatório de Sessão e apertar Enter no
 terminal; ele lê todas as páginas da lista, mostra quantos processos achou e pergunta antes de anexar.
+Depois volta para a página 1 da lista e abre cada processo clicando nele ali mesmo; ao terminar um
+processo, usa o 'voltar' do navegador para retornar à lista (não passa pela Página Inicial).
 (Com --lista relatar, ele abre sozinho a lista 'Relatar', como antes.)
 Feche esse Chrome quando terminar: enquanto ele está aberto, programas deste computador
 podem controlá-lo pela porta 9222.
@@ -434,13 +436,29 @@ def obter_total_paginas(page) -> int:
 def ir_para_proxima_pagina(page, seletor: str, numeros_atuais: list[str]) -> bool:
     """Clica em 'próxima' e espera a tabela trocar de conteúdo.
     (Os botões numerados não servem: o paginador só mostra ~10 deles por vez.)"""
+    return trocar_pagina(page, seletor, numeros_atuais, ".ui-paginator-next", "próxima")
+
+
+def ir_para_primeira_pagina(page, seletor: str) -> bool:
+    """Volta a lista para a página 1. True se já estava nela ou se conseguiu voltar."""
+    botao = achar_no_paginador(page, ".ui-paginator-first")
+    if botao is None or "ui-state-disabled" in (botao.get_attribute("class") or ""):
+        return True  # já está na página 1 (ou a lista tem uma página só)
+    if trocar_pagina(page, seletor, extrair_numeros_pagina(page, seletor), ".ui-paginator-first", "primeira"):
+        print("OK Voltou para a página 1 da lista")
+        return True
+    return False
+
+
+def trocar_pagina(page, seletor: str, numeros_atuais: list[str], classe: str, nome: str) -> bool:
+    """Clica no botão do paginador (classe) e espera a tabela trocar de conteúdo."""
     try:
-        botao = achar_no_paginador(page, ".ui-paginator-next")
+        botao = achar_no_paginador(page, classe)
         if botao is None:
-            print("AVISO: não achei o botão 'próxima página' na lista.")
+            print(f"AVISO: não achei o botão '{nome} página' na lista.")
             return False
         if "ui-state-disabled" in (botao.get_attribute("class") or ""):
-            return False  # última página
+            return False  # já está na última (ou na primeira) página
         contador_antes = texto_contador(page)
         botao.click()
         # Aqui o limite é sempre finito (mesmo com ESPERA_MS = 0): se a tabela nunca mudar,
@@ -458,13 +476,68 @@ def ir_para_proxima_pagina(page, seletor: str, numeros_atuais: list[str]) -> boo
             if reclicar and time.monotonic() > reclicar:
                 reclicar = None
                 if texto_contador(page) == contador_antes:
-                    print("AVISO: a lista não mudou; clicando em 'próxima' de novo.")
+                    print(f"AVISO: a lista não mudou; clicando em '{nome}' de novo.")
                     botao.dispatch_event("click")
-        print(f"AVISO: a tabela não mudou depois de clicar em 'próxima' "
+        print(f"AVISO: a tabela não mudou depois de clicar em '{nome}' "
               f"(contador antes: '{contador_antes}', agora: '{texto_contador(page)}').")
     except Exception as e:
-        print(f"AVISO: erro ao ir para a próxima página: {e}")
+        print(f"AVISO: erro ao ir para a {nome} página: {e}")
     return False
+
+
+TELA_PROCESSO = "[id='formProcesso:incluirDocumentoRequerimento']"
+
+
+def abrir_processo_da_lista(page, seletor: str, numero: str) -> bool:
+    """Leva a lista até a página em que o processo está e clica nele (abre na mesma aba).
+    True se a tela do processo abriu."""
+    try:
+        numeros = extrair_numeros_pagina(page, seletor)
+        if numero not in numeros:
+            # Procura desde a página 1: ao voltar do processo, a lista pode estar em qualquer página.
+            ir_para_primeira_pagina(page, seletor)
+            numeros = extrair_numeros_pagina(page, seletor)
+            while numero not in numeros and ir_para_proxima_pagina(page, seletor, numeros):
+                numeros = extrair_numeros_pagina(page, seletor)
+            if numero not in numeros:
+                print(f"ERRO Processo {numero} não está mais na lista.")
+                return False
+        item = page.locator(seletor).filter(has_text=numero).first
+        # Se a lista é de links, clica no link; se é de linhas, clica no número dentro da linha.
+        (item if seletor.endswith(" a") else item.get_by_text(numero).first).click()
+        page.wait_for_selector(TELA_PROCESSO, state="visible", timeout=ESPERA_MS)
+        print(f"OK Abriu o processo pela lista: {numero}")
+        return True
+    except Exception as e:
+        print(f"ERRO Falha ao abrir o processo {numero} pela lista: {e}")
+        return False
+
+
+def voltar_para_lista(page, seletor: str) -> bool:
+    """Volta do processo para a lista com o 'voltar' do navegador. True se a lista reapareceu."""
+    try:
+        page.go_back(timeout=ESPERA_MS)
+    except Exception as e:
+        print(f"AVISO: erro ao usar o 'voltar' do navegador: {e}")
+    if lista_na_tela(page, seletor, ESPERA_MS or ESPERA_PDF_MS):
+        print("OK Voltou para a lista")
+        return True
+    return False
+
+
+def lista_na_tela(page, seletor: str, timeout_ms: int) -> bool:
+    """A lista está na tela (e não a tela de um processo, que também pode ter números de processo)?"""
+    limite = time.monotonic() + timeout_ms / 1000
+    while True:
+        try:
+            if (extrair_numeros_pagina(page, seletor)
+                    and not page.locator(TELA_PROCESSO).filter(visible=True).count()):
+                return True
+        except Exception:
+            pass  # a aba estava trocando de página
+        if time.monotonic() > limite:
+            return False
+        page.wait_for_timeout(500)
 
 
 def coletar_todos_processos(page) -> list[tuple[str, int]]:
@@ -865,7 +938,12 @@ def etapa_coletar(navegador: str = "chrome", limite: int | None = None, lista: s
         if not processos:
             print("AVISO: nenhum processo encontrado. Encerrando a coleta.")
             return
+        seletor = None
         if lista != "relatar":
+            # Depois de contar, a lista está na última página: volta para a 1 e começa dali.
+            seletor = localizar_lista(page)
+            if not seletor or not ir_para_primeira_pagina(page, seletor):
+                raise SystemExit("Não consegui voltar para a página 1 da lista. Nada foi anexado.")
             # Tela escolhida por você: confere a lista antes de anexar (anexar grava no sistema).
             numeros = [n for n, _ in processos]
             amostra = (", ".join(numeros) if len(numeros) <= 5
@@ -909,13 +987,25 @@ def etapa_coletar(navegador: str = "chrome", limite: int | None = None, lista: s
             trabalhados += 1
 
             ja_anexado = status in STATUS_JA_ANEXADO
-            voltar_pagina_inicial(page)
-            if not fazer_busca_processo(page, numero):
+            if lista == "relatar":
+                voltar_pagina_inicial(page)
+                aberto = fazer_busca_processo(page, numero)
+            else:
+                # Abre o processo pela própria lista (sem passar pela Página Inicial).
+                if not lista_na_tela(page, seletor, ESPERA_CURTA_MS):
+                    print("AVISO: a lista do Relatório de Sessão não está na tela.")
+                    page = esperar_lista_do_usuario(page)
+                    seletor = localizar_lista(page)
+                aberto = abrir_processo_da_lista(page, seletor, numero)
+            if not aberto:
                 log.atualizar(numero, STATUS_ERRO_PDF if ja_anexado else "Erro na busca")
                 continue
 
             log.atualizar(numero, processar_fluxo_processo(page, numero, destino, log, ja_anexado))
             page.wait_for_timeout(2000)
+            # Se o 'voltar' não trouxer a lista, o próximo processo pede para você abri-la de novo.
+            if lista != "relatar" and not voltar_para_lista(page, seletor):
+                print("AVISO: o 'voltar' do navegador não trouxe a lista de volta.")
 
         print(f"\nColeta terminada. PDFs em: {PASTA_PDF}")
         print(f"Planilha de controle: {ARQ_LOG}")
