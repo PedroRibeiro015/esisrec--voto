@@ -103,7 +103,8 @@ PADRAO_PROCESSO = re.compile(r"\d{5}\.\d{6}/\d{4}-\d{2}")
 # Mesmo número, mas aceitando também a forma usada nos nomes de arquivo (com '_' no lugar de '/').
 PADRAO_ID_PROCESSO = re.compile(r"\d{5}\.\d{6}[/_]\d{4}-\d{2}")
 TABELA_PROCESSOS = "#tblProcessosMovimentacao"
-PAGINADOR = "#tblProcessosMovimentacao_paginator_top"
+PAGINADORES = (f"{TABELA_PROCESSOS}_paginator_top", f"{TABELA_PROCESSOS}_paginator_bottom",
+               "[id$='_paginator_top']", "[id$='_paginator_bottom']")
 # Atenção: este identificador é gerado automaticamente pelo site e pode mudar.
 SELETOR_IFRAME_PDF = "[id='arvoreDocumentosForm:j_idt118']"
 
@@ -317,7 +318,10 @@ class Log:
                         self.linhas[str(numero)] = linha
                 return
             except Exception as e:
-                print(f"AVISO: não consegui ler {caminho} ({e}). Criando uma planilha nova.")
+                # Não cria uma planilha nova: ela seria salva por cima desta, e o robô esqueceria
+                # quais processos já têm o documento anexado (e anexaria de novo).
+                raise SystemExit(f"Não consegui ler {caminho} ({e}). Feche-a no Excel e rode de novo. "
+                                 f"Se ela estiver estragada, restaure uma cópia; não apague.")
         self.wb = Workbook()
         self.ws = self.wb.active
         self.ws.title = "Processos"
@@ -376,43 +380,73 @@ def extrair_numeros_pagina(page) -> list[str]:
     return numeros
 
 
+def achar_no_paginador(page, classe: str):
+    """Primeiro elemento visível com essa classe no paginador da lista, ou None.
+    Procura no paginador de cima e no de baixo; se a tabela vier com outro id, em qualquer paginador."""
+    for paginador in PAGINADORES:
+        alvo = page.locator(f"{paginador} {classe}").filter(visible=True)
+        if alvo.count():
+            return alvo.first
+    return None
+
+
+def texto_contador(page) -> str:
+    """Texto do contador do paginador, ex.: '(1 de 9)'. Vazio se não achar."""
+    try:
+        contador = achar_no_paginador(page, ".ui-paginator-current")
+        return contador.inner_text().strip() if contador else ""
+    except Exception:
+        return ""
+
+
 def obter_total_paginas(page) -> int:
     """Lê o total de páginas a partir do texto '(1 de 9)'."""
-    try:
-        contador = page.locator(f"{PAGINADOR} .ui-paginator-current")
-        try:  # espera a lista carregar (antes lia na hora e dava "1 página" com a lista carregando)
-            contador.first.wait_for(state="visible", timeout=ESPERA_CURTA_MS)
-        except Exception:
-            return 1
-        texto = contador.first.inner_text()
+    # Espera a lista carregar (lendo na hora, com a lista carregando, dava "1 página").
+    limite = time.monotonic() + ESPERA_CURTA_MS / 1000
+    while True:
+        texto = texto_contador(page)
         achado = re.search(r"de\s+(\d+)", texto)
         if achado:
             total = int(achado.group(1))
-            print(f"Total de páginas detectado: {total}")
+            print(f"Total de páginas detectado: {total} (contador: '{texto}')")
             return total
-    except Exception as e:
-        print(f"AVISO: não foi possível detectar o total de páginas: {e}")
-    return 1
+        if time.monotonic() > limite:
+            print(f"AVISO: não achei o contador de páginas ('1 de N'). Texto lido: '{texto}'")
+            return 1
+        page.wait_for_timeout(500)
 
 
 def ir_para_proxima_pagina(page, numeros_atuais: list[str]) -> bool:
     """Clica em 'próxima' e espera a tabela trocar de conteúdo.
     (Os botões numerados não servem: o paginador só mostra ~10 deles por vez.)"""
     try:
-        botao = page.locator(f"{PAGINADOR} .ui-paginator-next")
-        if botao.count() == 0 or "ui-state-disabled" in (botao.first.get_attribute("class") or ""):
+        botao = achar_no_paginador(page, ".ui-paginator-next")
+        if botao is None:
+            print("AVISO: não achei o botão 'próxima página' na lista.")
             return False
-        botao.first.click()
+        if "ui-state-disabled" in (botao.get_attribute("class") or ""):
+            return False  # última página
+        contador_antes = texto_contador(page)
+        botao.click()
         # Aqui o limite é sempre finito (mesmo com ESPERA_MS = 0): se a tabela nunca mudar,
         # o robô ficaria preso para sempre.
         limite = time.monotonic() + (ESPERA_MS / 1000 if ESPERA_MS else ESPERA_PDF_MS / 1000)
+        reclicar = time.monotonic() + ESPERA_CURTA_MS / 1000
         while time.monotonic() < limite:
             page.wait_for_timeout(500)
             novos = extrair_numeros_pagina(page)
             if novos and novos != numeros_atuais:
                 page.wait_for_timeout(1000)  # deixa a tabela terminar de atualizar
                 return True
-        print("AVISO: a tabela não mudou depois de clicar em 'próxima'.")
+            # O clique às vezes se perde (lista ainda carregando). Clica de novo uma vez, mas só se
+            # o contador não mudou: se a página já trocou, outro clique pularia uma página.
+            if reclicar and time.monotonic() > reclicar:
+                reclicar = None
+                if texto_contador(page) == contador_antes:
+                    print("AVISO: a lista não mudou; clicando em 'próxima' de novo.")
+                    botao.dispatch_event("click")
+        print(f"AVISO: a tabela não mudou depois de clicar em 'próxima' "
+              f"(contador antes: '{contador_antes}', agora: '{texto_contador(page)}').")
     except Exception as e:
         print(f"AVISO: erro ao ir para a próxima página: {e}")
     return False
