@@ -34,6 +34,7 @@ Uso:
   python pipeline_processos.py relatorios --lote 2   (2 processos por envio; o padrão é 5)
   python pipeline_processos.py coletar --navegador playwright   (modo antigo)
   python pipeline_processos.py coletar --limite 1   (mexe em no máximo 1 processo: bom para teste)
+  python pipeline_processos.py coletar --lista relatar   (abre sozinho a lista 'Relatar', modo antigo)
   python pipeline_processos.py enviar --limite 1    (preenche e salva o Relatório e Voto de 1 processo)
 
 Modelo do relatório: edite prompt_relatorio.txt (na mesma pasta deste script). Para a IA seguir
@@ -50,6 +51,9 @@ Login (etapa 'coletar'): o script abre o Chrome instalado no computador, com um 
 próprio (pasta perfil_chrome_robo), sem abrir o site. Você entra no e-SISREC e faz o login
 nele normalmente; o robô começa sozinho assim que aparece a tela de unidade ou a tela principal.
 O login fica salvo nesse perfil para as próximas vezes.
+Depois do login, o robô espera você abrir a página do Relatório de Sessão e apertar Enter no
+terminal; ele lê todas as páginas da lista, mostra quantos processos achou e pergunta antes de anexar.
+(Com --lista relatar, ele abre sozinho a lista 'Relatar', como antes.)
 Feche esse Chrome quando terminar: enquanto ele está aberto, programas deste computador
 podem controlá-lo pela porta 9222.
 
@@ -362,22 +366,33 @@ def clicar(locator, descricao: str, tag: str, timeout: int = ESPERA_MS):
     print(f"OK [{tag}] {descricao}")
 
 
-def extrair_numeros_pagina(page) -> list[str]:
-    """Extrai os números de processo dos links da tabela (ou da página, se a tabela não for achada)."""
-    # Espera a tabela aparecer antes de ler: sem isso, uma tabela ainda carregando fazia o robô
-    # ler os links da página inteira (e pegar números de processo de fora da lista).
-    try:
-        page.locator(TABELA_PROCESSOS).first.wait_for(state="visible", timeout=ESPERA_CURTA_MS)
-        links = page.locator(f"{TABELA_PROCESSOS} a")
-    except Exception:
-        print(f"AVISO: tabela {TABELA_PROCESSOS} não encontrada; procurando números na página inteira.")
-        links = page.locator("a")
+# Onde ficam os números de processo da lista, em ordem de preferência: a lista "Relatar" (id
+# conhecido) e, em outras telas (como o Relatório de Sessão), a tabela de dados da página, pelos
+# links ou, se os números não forem links, pelas linhas.
+SELETORES_LISTA = (f"{TABELA_PROCESSOS} a", ".ui-datatable-data a", ".ui-datatable-data > tr")
+
+
+def extrair_numeros_pagina(page, seletor: str) -> list[str]:
+    """Extrai os números de processo dos elementos da lista (um número por elemento)."""
     numeros = []
-    for texto in links.all_inner_texts():
+    for texto in page.locator(seletor).all_inner_texts():
         achado = PADRAO_PROCESSO.search(texto)
         if achado and achado.group() not in numeros:
             numeros.append(achado.group())
     return numeros
+
+
+def localizar_lista(page, timeout_ms: int = ESPERA_CURTA_MS) -> str | None:
+    """Espera a lista de processos aparecer e devolve o seletor dela (de SELETORES_LISTA), ou None.
+    Esperar é preciso: com a tabela ainda carregando, o robô lia uma lista vazia ou incompleta."""
+    limite = time.monotonic() + timeout_ms / 1000
+    while True:
+        for seletor in SELETORES_LISTA:
+            if extrair_numeros_pagina(page, seletor):
+                return seletor
+        if time.monotonic() > limite:
+            return None
+        page.wait_for_timeout(500)
 
 
 def achar_no_paginador(page, classe: str):
@@ -416,7 +431,7 @@ def obter_total_paginas(page) -> int:
         page.wait_for_timeout(500)
 
 
-def ir_para_proxima_pagina(page, numeros_atuais: list[str]) -> bool:
+def ir_para_proxima_pagina(page, seletor: str, numeros_atuais: list[str]) -> bool:
     """Clica em 'próxima' e espera a tabela trocar de conteúdo.
     (Os botões numerados não servem: o paginador só mostra ~10 deles por vez.)"""
     try:
@@ -434,7 +449,7 @@ def ir_para_proxima_pagina(page, numeros_atuais: list[str]) -> bool:
         reclicar = time.monotonic() + ESPERA_CURTA_MS / 1000
         while time.monotonic() < limite:
             page.wait_for_timeout(500)
-            novos = extrair_numeros_pagina(page)
+            novos = extrair_numeros_pagina(page, seletor)
             if novos and novos != numeros_atuais:
                 page.wait_for_timeout(1000)  # deixa a tabela terminar de atualizar
                 return True
@@ -455,11 +470,15 @@ def ir_para_proxima_pagina(page, numeros_atuais: list[str]) -> bool:
 def coletar_todos_processos(page) -> list[tuple[str, int]]:
     """Percorre todas as páginas da lista. Retorna [(numero, pagina), ...] sem repetidos."""
     processos, vistos = [], set()
+    seletor = localizar_lista(page)
+    if seletor is None:
+        print("AVISO: não achei números de processo na tela aberta.")
+        return processos
     total = obter_total_paginas(page)
     print(f"Coletando processos de {total} página(s)...")
     pagina = 1
     while True:
-        numeros = extrair_numeros_pagina(page)
+        numeros = extrair_numeros_pagina(page, seletor)
         novos = 0
         for numero in numeros:
             if numero not in vistos:
@@ -467,7 +486,7 @@ def coletar_todos_processos(page) -> list[tuple[str, int]]:
                 processos.append((numero, pagina))
                 novos += 1
         print(f"Página {pagina}: {novos} processos. Total parcial: {len(processos)}")
-        if not ir_para_proxima_pagina(page, numeros):
+        if not ir_para_proxima_pagina(page, seletor, numeros):
             if pagina < total:
                 print(f"AVISO: não foi possível ir para a página {pagina + 1} de {total}. "
                       f"Parando a coleta.")
@@ -485,6 +504,28 @@ def abrir_lista_relatar(page):
     clicar(page.get_by_text(TEXTO_LINK_LISTA, exact=True), "Abriu a lista 'Relatar'", "lista",
            timeout=0)
     page.wait_for_timeout(5000)
+
+
+def esperar_lista_do_usuario(page):
+    """Espera você abrir, no Chrome do robô, a tela com a lista de processos (ex.: Relatório de
+    Sessão) e apertar Enter. Devolve a aba em que a lista está (pode ser outra aba)."""
+    print("=" * 60)
+    print("No Chrome do robô, abra a página do Relatório de Sessão com a lista de processos.")
+    print("Quando a lista aparecer, volte aqui e aperte Enter (o robô não mexe em nada antes disso).")
+    print("=" * 60)
+    host = urlparse(URL_SISTEMA).netloc
+    while True:
+        try:
+            input("Lista aberta? Aperte Enter... ")
+        except EOFError:
+            raise SystemExit("Sem teclado para confirmar que a lista está aberta. Cancelado.")
+        # A aba mais nova primeiro: se você abriu a lista numa aba nova, é ela.
+        for aba in reversed(page.context.pages):
+            if urlparse(aba.url).netloc == host and localizar_lista(aba, timeout_ms=3000):
+                aba.bring_to_front()
+                return aba
+        print("Não achei nenhuma lista de processos nas abas do e-SISREC. Abra a lista e aperte Enter "
+              "de novo (ou Ctrl+C para cancelar).")
 
 
 def selecionar_unidade_se_preciso(page):
@@ -808,18 +849,35 @@ def sistema_logado(navegador: str = "chrome"):
                 pass
 
 
-def etapa_coletar(navegador: str = "chrome", limite: int | None = None):
+def etapa_coletar(navegador: str = "chrome", limite: int | None = None, lista: str = "sessao"):
     """limite: número máximo de processos em que o robô entra (anexa/baixa). Os que já têm PDF
-    ou estão para conferir não contam, porque o robô não mexe neles."""
+    ou estão para conferir não contam, porque o robô não mexe neles.
+    lista: 'sessao' espera você abrir o Relatório de Sessão; 'relatar' abre a lista 'Relatar' sozinho."""
     PASTA_PDF.mkdir(parents=True, exist_ok=True)
     log = Log(ARQ_LOG)
 
     with sistema_logado(navegador) as page:
-        abrir_lista_relatar(page)
+        if lista == "relatar":
+            abrir_lista_relatar(page)
+        else:
+            page = esperar_lista_do_usuario(page)
         processos = coletar_todos_processos(page)
         if not processos:
             print("AVISO: nenhum processo encontrado. Encerrando a coleta.")
             return
+        if lista != "relatar":
+            # Tela escolhida por você: confere a lista antes de anexar (anexar grava no sistema).
+            numeros = [n for n, _ in processos]
+            amostra = (", ".join(numeros) if len(numeros) <= 5
+                       else f"{', '.join(numeros[:3])} ... {', '.join(numeros[-2:])}")
+            print(f"\nAchei {len(numeros)} processo(s) nessa lista: {amostra}")
+            try:
+                resposta = input(f"O robô vai anexar o documento e baixar o PDF desses processos"
+                                 f"{f' (no máximo {limite})' if limite else ''}. Continuar? (s/n) ")
+            except EOFError:
+                resposta = ""
+            if resposta.strip().lower() not in ("s", "sim"):
+                raise SystemExit("Cancelado. Nada foi anexado.")
 
         for numero, pagina in processos:
             log.adicionar(numero, pagina)
@@ -1595,6 +1653,9 @@ def main():
     ap.add_argument("--lote", type=int, metavar="N",
                     help=f"relatorios: processos por envio à IA (padrão: {TAMANHO_LOTE}). Se uma "
                          f"resposta vier cortada, os processos que faltaram são reenviados um a um")
+    ap.add_argument("--lista", choices=["sessao", "relatar"], default="sessao",
+                    help="coletar: sessao (padrão): espera você abrir o Relatório de Sessão e apertar "
+                         "Enter; relatar: o robô abre sozinho a lista 'Relatar'")
     ap.add_argument("--limite", type=int, metavar="N",
                     help="coletar: mexe em no máximo N processos (anexar e baixar). Útil para testes")
     args = ap.parse_args()
@@ -1604,7 +1665,7 @@ def main():
         ap.error("--lote precisa ser 1 ou mais")
 
     if args.etapa in ("coletar", "tudo"):
-        etapa_coletar(args.navegador, args.limite)
+        etapa_coletar(args.navegador, args.limite, args.lista)
     if args.etapa in ("converter", "tudo"):
         etapa_converter()
     if args.etapa in ("relatorios", "tudo"):
