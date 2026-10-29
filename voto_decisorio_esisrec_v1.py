@@ -488,9 +488,13 @@ def main():
     ws.title = "Voto Decisorio"
     ws.append(["Processo", "Status", "Detalhe", "Data/Hora"])
 
+    erros = []  # (numero, status, detalhe) dos processos que deram erro, mostrados no fim
+
     def log(numero, status, detalhe=""):
         ws.append([numero, status, detalhe, datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
         salvar_log(wb, caminho_log)
+        if status.startswith("Erro"):
+            erros.append((numero, status, detalhe))
 
     garantir_chrome()
     esperar_login()
@@ -502,6 +506,7 @@ def main():
         if page is None:
             page = context.pages[0] if context.pages else context.new_page()
 
+        processou = False
         try:
             ouvir_consultar(context, page)
             print("Escolha o perfil no navegador, se for pedido. Aguardando...")
@@ -535,6 +540,7 @@ def main():
                 time.sleep(10)
 
             primeiro = True
+            processou = True
             for idx, (numero, tem_voto) in enumerate(todos):
                 print(f"\n--- {idx + 1}/{len(todos)}: {numero} ---")
                 # Só vota se a coluna Voto(s) da lista estava verde; em branco, pula
@@ -561,6 +567,22 @@ def main():
 
         except Exception:
             traceback.print_exc()
+        finally:
+            # Mostra mesmo se o lote parou no meio (erro geral ou Ctrl+C)
+            if processou:
+                mostrar_erros(erros, caminho_log)
+
+
+def mostrar_erros(erros, caminho_log):
+    print("\n" + "=" * 70)
+    if not erros:
+        print(" Nenhum processo deu erro.")
+    else:
+        print(f" {len(erros)} PROCESSO(S) COM ERRO. Verifique manualmente:")
+        for numero, status, detalhe in erros:
+            print(f"   {numero}  {status}" + (f": {detalhe}" if detalhe else ""))
+        print(f" (Detalhes também no log: {caminho_log})")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
