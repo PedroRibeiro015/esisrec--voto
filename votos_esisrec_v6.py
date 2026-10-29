@@ -27,8 +27,8 @@ DRY_RUN = False
 MIN_CARACTERES = 10
 
 SEL = {
-    # Paginador da lista de processos (AJUSTAR para a tela da sessão, se diferente)
-    "paginador": "[id$='_paginator_top']",
+    # Paginadores da lista de processos (o de cima e o de baixo; a tela pode ter só um deles)
+    "paginadores": ("[id$='_paginator_top']", "[id$='_paginator_bottom']"),
 
     # Tela do processo: item "Voto" da lista de Ações
     "link_voto": "[id='formProcesso:cadastrarRelatorioVoto']",
@@ -59,14 +59,15 @@ PADRAO_PROCESSO = re.compile(r'\d{5}\.\d{6}/\d{4}-\d{2}')
 
 def area_lista(page):
     """Tabela que contém o paginador; se não achar, a página inteira."""
-    tabela = page.locator(SEL["paginador"]).first.locator(
-        "xpath=ancestor::*[contains(@class,'ui-datatable')][1]"
-    )
-    try:
-        if tabela.count() > 0:
-            return tabela
-    except Exception:
-        pass
+    for paginador in SEL["paginadores"]:
+        tabela = page.locator(paginador).first.locator(
+            "xpath=ancestor::*[contains(@class,'ui-datatable')][1]"
+        )
+        try:
+            if tabela.count() > 0:
+                return tabela
+        except Exception:
+            pass
     return page.locator("body")
 
 
@@ -75,40 +76,68 @@ def extrair_numeros_processos_pagina(page):
     return [t.strip() for t in textos if PADRAO_PROCESSO.fullmatch(t.strip())]
 
 
-def obter_total_paginas(page):
+def achar_no_paginador(page, classe):
+    """Primeiro elemento visível com essa classe no paginador de cima ou no de baixo, ou None."""
+    for paginador in SEL["paginadores"]:
+        alvo = page.locator(f"{paginador} {classe}").filter(visible=True)
+        if alvo.count():
+            return alvo.first
+    return None
+
+
+def texto_contador(page):
+    """Texto do contador do paginador, ex.: '(1 de 9)'. Vazio se não achar."""
     try:
-        paginator = page.locator(f"{SEL['paginador']} .ui-paginator-current").first
-        texto = paginator.inner_text(timeout=5000)
+        contador = achar_no_paginador(page, ".ui-paginator-current")
+        return contador.inner_text().strip() if contador else ""
+    except Exception:
+        return ""
+
+
+def obter_total_paginas(page, timeout=15):
+    # Espera o contador aparecer: lendo na hora, com a lista ainda carregando, dava "1 página"
+    limite = time.time() + timeout
+    while time.time() < limite:
+        texto = texto_contador(page)
         match = re.search(r'de\s+(\d+)', texto)
         if match:
             total = int(match.group(1))
-            print(f" Total de páginas detectado: {total}")
+            print(f" Total de páginas detectado: {total} (contador: '{texto}')")
             return total
-    except Exception as e:
-        print(f" Paginador não encontrado (assumindo 1 página): {str(e).splitlines()[0]}")
+        page.wait_for_timeout(500)
+    print(" Contador de páginas não encontrado (assumindo 1 página).")
     return 1
 
 
-def navegar_para_pagina(page, numero_pagina, timeout=30):
+def ir_para_proxima_pagina(page, antes, timeout=60):
+    """Clica em 'próxima' e espera a tabela trocar de conteúdo. False se já está na última.
+    (Os botões numerados não servem: o paginador só mostra ~10 deles por vez.)"""
     try:
-        btn = page.locator(f"{SEL['paginador']} .ui-paginator-page").filter(
-            has_text=re.compile(rf"^\s*{numero_pagina}\s*$")
-        ).first
-        if btn.count() == 0:
+        btn = achar_no_paginador(page, ".ui-paginator-next")
+        if btn is None or "ui-state-disabled" in (btn.get_attribute("class") or ""):
             return False
-        antes = extrair_numeros_processos_pagina(page)
+        contador_antes = texto_contador(page)
         btn.click()
         # O PrimeFaces troca a tabela via AJAX: espera o conteúdo mudar de fato
         limite = time.time() + timeout
+        reclicar = time.time() + 15
         while time.time() < limite:
+            page.wait_for_timeout(500)
             agora = extrair_numeros_processos_pagina(page)
             if agora and agora != antes:
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(1000)
                 return True
-            page.wait_for_timeout(500)
-        print(f" A página {numero_pagina} não carregou em {timeout}s.")
+            # O clique às vezes se perde. Clica de novo uma vez, só se o contador não mudou
+            # (se a página já trocou, outro clique pularia uma página).
+            if reclicar and time.time() > reclicar:
+                reclicar = None
+                if texto_contador(page) == contador_antes:
+                    print(" A lista não mudou; clicando em 'próxima' de novo.")
+                    btn.dispatch_event("click")
+        print(f" A próxima página não carregou em {timeout}s "
+              f"(contador antes: '{contador_antes}', agora: '{texto_contador(page)}').")
     except Exception as e:
-        print(f" Erro ao navegar para página {numero_pagina}: {e}")
+        print(f" Erro ao ir para a próxima página: {e}")
     return False
 
 
@@ -116,13 +145,16 @@ def coletar_todos_processos(page):
     todos = []
     total_paginas = obter_total_paginas(page)
     print(f" Coletando processos de {total_paginas} página(s)...")
-    for pagina in range(1, total_paginas + 1):
-        if pagina > 1 and not navegar_para_pagina(page, pagina):
-            print(f" Não foi possível ir à página {pagina}. Parando coleta.")
-            break
+    pagina = 1
+    while True:
         nums = extrair_numeros_processos_pagina(page)
         todos.extend(nums)
         print(f"Página {pagina}: {len(nums)} processos. Total parcial: {len(todos)}")
+        if not ir_para_proxima_pagina(page, nums):
+            if pagina < total_paginas:
+                print(f" Não foi possível ir à página {pagina + 1} de {total_paginas}. Parando coleta.")
+            break
+        pagina += 1
     # remove duplicados mantendo a ordem
     todos = list(dict.fromkeys(todos))
     print(f"\n Total coletado: {len(todos)} processos.")
