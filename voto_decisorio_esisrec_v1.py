@@ -16,7 +16,8 @@ from urllib.parse import urlparse
 # ======================================================================
 # CONFIGURAÇÃO
 # ======================================================================
-PASTA_LOG = r"C:\Users\Pedro\Downloads\processos"
+# Pasta "processos" dentro dos Downloads de quem estiver rodando o script
+PASTA_LOG = os.path.join(os.path.expanduser("~"), "Downloads", "processos")
 UNIDADE = "GOV:CRPS.10ª JR"
 URL_SISTEMA = "https://esisrec.inss.gov.br/esisrec/"
 

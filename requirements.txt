@@ -1,0 +1,5 @@
+# Pacotes para os scripts de voto (voto_decisorio_esisrec_v1.py, votos_esisrec_v6.py)
+# Instalar com: pip install -r requirements.txt
+# Também é preciso ter o Google Chrome instalado (não precisa rodar "playwright install").
+playwright>=1.51
+openpyxl
