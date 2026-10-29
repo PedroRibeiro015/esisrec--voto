@@ -79,6 +79,61 @@ def extrair_numeros_processos_pagina(page):
     return [t.strip() for t in textos if PADRAO_PROCESSO.fullmatch(t.strip())]
 
 
+# Lê cada linha da lista: os links (onde está o número do processo) e se a coluna "Voto(s)"
+# está verde (já tem voto) ou cinza/em branco (sem voto). O verde é reconhecido pela cor
+# do ícone ou por um nome de "check" na classe/título/imagem.
+JS_LER_LINHAS = """
+(tabela) => {
+  const ths = [...tabela.querySelectorAll('thead th')];
+  const col = ths.findIndex(th => /^voto\\(s\\)$/i.test(th.innerText.trim()));
+  const corpo = tabela.querySelector('tbody.ui-datatable-data') || tabela.querySelector('tbody');
+  if (!corpo) return {col, linhas: []};
+  const verde = (cor) => {
+    const m = (cor || '').match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)(?:,\\s*([\\d.]+))?/);
+    if (!m || m[4] === '0') return false;
+    const [r, g, b] = [+m[1], +m[2], +m[3]];
+    return g >= 100 && g > r + 50 && g > b + 50;
+  };
+  const temVoto = (cel) => {
+    for (const el of [cel, ...cel.querySelectorAll('*')]) {
+      const s = getComputedStyle(el);
+      if (verde(s.backgroundColor) || verde(s.color) || verde(s.fill) || verde(s.borderColor)) return true;
+      const nomes = [el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className,
+                     el.getAttribute('title'), el.getAttribute('alt'), el.getAttribute('src')].join(' ');
+      if (/check|\\bok\\b|success|verde/i.test(nomes)) return true;
+    }
+    return false;
+  };
+  const linhas = [...corpo.children].filter(tr => tr.tagName === 'TR').map(tr => {
+    const tds = [...tr.children].filter(td => td.tagName === 'TD');
+    return {
+      textos: [...tr.querySelectorAll('a')].map(a => a.innerText.trim()),
+      voto: col >= 0 && tds[col] ? temVoto(tds[col]) : null,
+    };
+  });
+  return {col, linhas};
+}
+"""
+
+
+def extrair_linhas_pagina(page):
+    """[(numero, tem_voto), ...] da página atual. tem_voto é None se a coluna Voto(s) não foi achada."""
+    tabela = area_lista(page)
+    try:
+        dados = tabela.first.evaluate(JS_LER_LINHAS)
+    except Exception as e:
+        print(f" Não consegui ler as linhas da lista: {e}")
+        return []
+    if dados["col"] < 0:
+        print(" AVISO: coluna 'Voto(s)' não encontrada na lista.")
+    linhas = []
+    for linha in dados["linhas"]:
+        numero = next((t for t in linha["textos"] if PADRAO_PROCESSO.fullmatch(t)), None)
+        if numero:
+            linhas.append((numero, linha["voto"]))
+    return linhas
+
+
 def achar_no_paginador(page, classe):
     """Primeiro elemento visível com essa classe no paginador de cima ou no de baixo, ou None."""
     for paginador in SEL["paginadores"]:
@@ -145,22 +200,25 @@ def ir_para_proxima_pagina(page, antes, timeout=60):
 
 
 def coletar_todos_processos(page):
-    todos = []
+    """Percorre todas as páginas. Retorna [(numero, tem_voto), ...] sem repetidos."""
+    todos = {}
     total_paginas = obter_total_paginas(page)
     print(f" Coletando processos de {total_paginas} página(s)...")
     pagina = 1
     while True:
-        nums = extrair_numeros_processos_pagina(page)
-        todos.extend(nums)
-        print(f"Página {pagina}: {len(nums)} processos. Total parcial: {len(todos)}")
-        if not ir_para_proxima_pagina(page, nums):
+        linhas = extrair_linhas_pagina(page)
+        for numero, tem_voto in linhas:
+            todos.setdefault(numero, tem_voto)
+        com_voto = sum(1 for _, v in linhas if v)
+        print(f"Página {pagina}: {len(linhas)} processos ({com_voto} com voto). Total parcial: {len(todos)}")
+        if not ir_para_proxima_pagina(page, extrair_numeros_processos_pagina(page)):
             if pagina < total_paginas:
                 print(f" Não foi possível ir à página {pagina + 1} de {total_paginas}. Parando coleta.")
             break
         pagina += 1
-    # remove duplicados mantendo a ordem
-    todos = list(dict.fromkeys(todos))
-    print(f"\n Total coletado: {len(todos)} processos.")
+    todos = list(todos.items())
+    print(f"\n Total coletado: {len(todos)} processos, "
+          f"{sum(1 for _, v in todos if v)} com voto (verde).")
     return todos
 
 
@@ -470,17 +528,25 @@ def main():
             if not todos:
                 print(" Nenhum processo encontrado. Encerrando.")
                 return
-            print(f" Primeiros processos: {', '.join(todos[:3])}")
+            print(f" Primeiros processos: {', '.join(n for n, _ in todos[:3])}")
             if not DRY_RUN:
                 print(" ATENÇÃO: DRY_RUN = False, os votos decisórios serão registrados de verdade. "
                       "Começando em 10 s (Ctrl+C para cancelar)...")
                 time.sleep(10)
 
-            for idx, numero in enumerate(todos):
+            primeiro = True
+            for idx, (numero, tem_voto) in enumerate(todos):
                 print(f"\n--- {idx + 1}/{len(todos)}: {numero} ---")
+                # Só vota se a coluna Voto(s) da lista estava verde; em branco, pula
+                if not tem_voto:
+                    print(" Sem voto na lista (em branco): pulando")
+                    log(numero, "Sem voto", "coluna Voto(s) em branco"
+                        if tem_voto is False else "coluna Voto(s) não encontrada")
+                    continue
                 try:
-                    if idx > 0:
+                    if not primeiro:
                         voltar_inicio(page)
+                    primeiro = False
                     if not fazer_busca_processo(page, numero):
                         log(numero, "Erro na busca")
                         continue
