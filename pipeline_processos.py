@@ -44,17 +44,24 @@ prontos não são refeitos: para refazer com o modelo novo, apague-os da pasta '
 Envio (etapa 'enviar'): usa o .docx da pasta 'relatorios' (com as edições feitas no Word, se houver),
 que precisa ter as partes RELATÓRIO, VOTO e EMENTA. Marca sempre: matéria de alçada 'Não', decisão
 'Conhecer do Recurso e negar-lhe provimento', tipo de decisão 'Sem concessão' e tipo de objeto 'Sim'.
-Por isso só envia processos cujo voto conclui por negar provimento; os outros ficam para conferir.
-Não sobrescreve um Relatório e Voto que já tenha texto. Controle em envio_log.xlsx.
+Se o voto não conclui por negar provimento, envia o texto mesmo assim, mas não marca a decisão nem o
+tipo de decisão (ficam para conferir à mão).
+Se o Relatório e Voto já tiver texto, ele é SUBSTITUÍDO pelo gerado pela IA. Não envia um .docx que
+cite outro número de processo e não o dele. Controle em envio_log.xlsx.
 
 Login (etapa 'coletar'): o script abre o Chrome instalado no computador, com um perfil
 próprio (pasta perfil_chrome_robo), sem abrir o site. Você entra no e-SISREC e faz o login
 nele normalmente; o robô começa sozinho assim que aparece a tela de unidade ou a tela principal.
 O login fica salvo nesse perfil para as próximas vezes.
-Depois do login, o robô espera você abrir a página do Relatório de Sessão e apertar Enter no
-terminal; ele lê todas as páginas da lista, mostra quantos processos achou e pergunta antes de anexar.
-Depois volta para a página 1 da lista e abre cada processo clicando nele ali mesmo; ao terminar um
-processo, usa o 'voltar' do navegador para retornar à lista (não passa pela Página Inicial).
+Depois do login, o robô espera você abrir a página do Relatório de Sessão e percebe sozinho quando
+a lista aparece (nada é perguntado no terminal); ele lê todas as páginas da lista, mostra quantos
+processos achou e espera ESPERA_CANCELAR_S segundos antes de anexar (Ctrl+C cancela).
+Depois volta para a página 1 da lista e abre o 1º processo clicando nele ali mesmo. Ao terminar um
+processo, fecha o visualizador de PDF e abre o próximo pela busca rápida da tela em que está (se ela
+não estiver na tela, passa pela Página Inicial). Não usa o 'voltar' do navegador: no e-SISREC ele
+não traz a lista de volta. Se o paginador da lista parar de responder, o robô pede para você abrir
+a lista de novo e continua sozinho quando ela aparecer. Antes de mexer num processo, confere se o
+número dele aparece na tela aberta.
 (Com --lista relatar, ele abre sozinho a lista 'Relatar', como antes.)
 Feche esse Chrome quando terminar: enquanto ele está aberto, programas deste computador
 podem controlá-lo pela porta 9222.
@@ -104,6 +111,7 @@ PORTA_CHROME = 9222
 ESPERA_MS = 120_000        # elementos da página (2 min). Use 0 para esperar sem limite.
 ESPERA_CURTA_MS = 15_000   # tentativa principal, antes de usar a alternativa
 ESPERA_PDF_MS = 300_000    # geração e carregamento do PDF (5 min)
+ESPERA_CANCELAR_S = 15     # coleta pelo Relatório de Sessão: tempo para cancelar antes de anexar
 
 PADRAO_PROCESSO = re.compile(r"\d{5}\.\d{6}/\d{4}-\d{2}")
 # Mesmo número, mas aceitando também a forma usada nos nomes de arquivo (com '_' no lugar de '/').
@@ -124,6 +132,9 @@ LINHAS_CARIMBO = re.compile(
     r"|\d{5}\.\d{6}/\d{4}-\d{2} - .*\d{2}/\d{2}/\d{4} \d{2}:\d{2}(:\d{2})?)\s*$",
     re.MULTILINE)
 AVISO_PAGINA_SEM_TEXTO = "[PÁGINA SEM TEXTO: imagem digitalizada, conteúdo não lido]"
+# Número do processo dentro do carimbo (a 3ª forma de LINHAS_CARIMBO).
+CARIMBO_NUMERO = re.compile(r"^\s*(\d{5}\.\d{6}/\d{4}-\d{2}) - .*\d{2}/\d{2}/\d{4} \d{2}:\d{2}",
+                            re.MULTILINE)
 
 # Relatórios
 # Claude (padrão): usa o comando 'claude' do Claude Code, logado com o seu plano Pro/Max.
@@ -134,7 +145,7 @@ CLAUDE_TIMEOUT_S = 900                              # tempo máximo de um envio 
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 TAMANHO_LOTE = 5                  # processos por envio à IA (só por causa do limite de envio)
-MAX_CARACTERES_ENVIO = 200_000    # limite de texto por envio; ajuste conforme o limite da IA
+MAX_CARACTERES_ENVIO = 200_000    # texto por envio ao juntar processos; um processo maior vai sozinho
 MAX_TOKENS_RESPOSTA = 8000
 
 # Marcador que separa os relatórios dentro da resposta da IA.
@@ -488,24 +499,64 @@ def trocar_pagina(page, seletor: str, numeros_atuais: list[str], classe: str, no
 TELA_PROCESSO = "[id='formProcesso:incluirDocumentoRequerimento']"
 
 
-def abrir_processo_da_lista(page, seletor: str, numero: str) -> bool:
+# Árvore Documental / visualizador de PDF: também é "dentro do processo" ao voltar para a lista.
+TELA_DENTRO_PROCESSO = f"{TELA_PROCESSO}, [id='arvoreDocumentosForm']"
+
+
+def so_digitos(texto: str) -> str:
+    return re.sub(r"[./-]", "", texto)
+
+
+def processo_na_tela(page, numero: str, timeout_ms: int = ESPERA_CURTA_MS) -> bool:
+    """A tela aberta é mesmo a do processo 'numero'? (Evita baixar ou gravar no processo errado.)
+    Compara só os dígitos, porque a tela pode escrever o número com ou sem pontuação."""
+    alvo = so_digitos(numero)
+    limite = time.monotonic() + timeout_ms / 1000
+    while True:
+        try:
+            if alvo in so_digitos(page.locator("body").inner_text()):
+                return True
+        except Exception:
+            pass  # a página estava carregando
+        if time.monotonic() > limite:
+            return False
+        page.wait_for_timeout(500)
+
+
+# Resultado de abrir_processo_da_lista quando o paginador parou de responder (não é que o processo
+# saiu da lista): aí vale abrir a lista de novo e tentar outra vez.
+PAGINADOR_TRAVADO = "paginador"
+
+
+def abrir_processo_da_lista(page, seletor: str, numero: str) -> bool | str:
     """Leva a lista até a página em que o processo está e clica nele (abre na mesma aba).
-    True se a tela do processo abriu."""
+    True se a tela do processo abriu; PAGINADOR_TRAVADO se não deu para trocar de página."""
     try:
         numeros = extrair_numeros_pagina(page, seletor)
         if numero not in numeros:
             # Procura desde a página 1: ao voltar do processo, a lista pode estar em qualquer página.
-            ir_para_primeira_pagina(page, seletor)
+            if not ir_para_primeira_pagina(page, seletor):
+                return PAGINADOR_TRAVADO
             numeros = extrair_numeros_pagina(page, seletor)
             while numero not in numeros and ir_para_proxima_pagina(page, seletor, numeros):
                 numeros = extrair_numeros_pagina(page, seletor)
             if numero not in numeros:
+                proxima = achar_no_paginador(page, ".ui-paginator-next")
+                if proxima is not None and "ui-state-disabled" not in (proxima.get_attribute("class") or ""):
+                    # Não chegou à última página: o paginador é que não respondeu.
+                    print(f"AVISO: o paginador parou de responder (contador: '{texto_contador(page)}').")
+                    return PAGINADOR_TRAVADO
                 print(f"ERRO Processo {numero} não está mais na lista.")
                 return False
+        print(f"[lista] {numero} está na página {texto_contador(page) or '?'}; abrindo.")
         item = page.locator(seletor).filter(has_text=numero).first
         # Se a lista é de links, clica no link; se é de linhas, clica no número dentro da linha.
         (item if seletor.endswith(" a") else item.get_by_text(numero).first).click()
         page.wait_for_selector(TELA_PROCESSO, state="visible", timeout=ESPERA_MS)
+        if not processo_na_tela(page, numero):
+            print(f"ERRO Abriu um processo, mas o número {numero} não aparece na tela: "
+                  f"pode ser outro processo. Não mexi nele.")
+            return False
         print(f"OK Abriu o processo pela lista: {numero}")
         return True
     except Exception as e:
@@ -513,15 +564,45 @@ def abrir_processo_da_lista(page, seletor: str, numero: str) -> bool:
         return False
 
 
+VOLTAS_MAX = 5          # quantas vezes o robô usa o 'voltar' do navegador até a lista reaparecer
+TEMPO_VOLTAR_MS = 5000  # espera de cada 'voltar' começar a trocar a página
+
+
 def voltar_para_lista(page, seletor: str) -> bool:
-    """Volta do processo para a lista com o 'voltar' do navegador. True se a lista reapareceu."""
-    try:
-        page.go_back(timeout=ESPERA_MS)
-    except Exception as e:
-        print(f"AVISO: erro ao usar o 'voltar' do navegador: {e}")
-    if lista_na_tela(page, seletor, ESPERA_MS or ESPERA_PDF_MS):
-        print("OK Voltou para a lista")
-        return True
+    """Volta do processo para a lista com o 'voltar' do navegador. True se a lista reapareceu.
+    Um 'voltar' às vezes não basta: o visualizador de PDF (que fica num quadro dentro da página)
+    também entra no histórico, e o 1º 'voltar' só desfaz ele. Por isso volta um passo por vez,
+    conferindo a lista a cada passo. Só volta de novo enquanto ainda está dentro do processo: se já
+    saiu dele e a lista não apareceu, espera por ela em vez de voltar mais (antes, uma lista lenta
+    para carregar fazia o robô passar dela e ir parar em telas anteriores)."""
+    for vez in range(1, VOLTAS_MAX + 1):
+        try:
+            # 'commit' e tempo curto: quando o 'voltar' só mexe no quadro do PDF, a página de cima
+            # não troca e o go_back nunca responde (antes o robô ficava minutos esperando aqui).
+            page.go_back(wait_until="commit", timeout=TEMPO_VOLTAR_MS)
+            page.wait_for_load_state("domcontentloaded", timeout=ESPERA_MS or ESPERA_PDF_MS)
+        except Exception:
+            pass
+        if lista_na_tela(page, seletor, ESPERA_CURTA_MS):
+            print("OK Voltou para a lista" + (f" (com {vez} 'voltar')" if vez > 1 else ""))
+            return True
+        try:
+            dentro = page.locator(TELA_DENTRO_PROCESSO).filter(visible=True).count() > 0
+        except Exception:
+            dentro = False
+        if dentro:
+            print(f"[voltar] nº {vez}: ainda dentro do processo (PDF ou árvore); voltando de novo.")
+            continue
+        print(f"[voltar] nº {vez}: saiu do processo; esperando a lista carregar "
+              f"(até {2 * ESPERA_CURTA_MS // 1000} s; se ela não vier, sigo pela busca rápida) "
+              f"(endereço: {page.url}, título: '{page.title()}')")
+        # 30 s bastam: se a página da lista já carregou e os processos não estão nela, eles não vêm
+        # (antes o robô ficava 2 min parado aqui).
+        if lista_na_tela(page, seletor, 2 * ESPERA_CURTA_MS):
+            print("OK Voltou para a lista")
+            return True
+        break
+    print(f"AVISO: depois do 'voltar' a lista não apareceu (endereço: {page.url}).")
     return False
 
 
@@ -579,26 +660,54 @@ def abrir_lista_relatar(page):
     page.wait_for_timeout(5000)
 
 
-def esperar_lista_do_usuario(page):
-    """Espera você abrir, no Chrome do robô, a tela com a lista de processos (ex.: Relatório de
-    Sessão) e apertar Enter. Devolve a aba em que a lista está (pode ser outra aba)."""
+def listas_abertas(page) -> dict:
+    """{aba: números da 1ª página da lista} de cada aba do e-SISREC que mostra uma lista de
+    processos (a tela de um processo não conta, mesmo tendo números de processo)."""
+    host = urlparse(URL_SISTEMA).netloc
+    achadas = {}
+    for aba in list(page.context.pages):
+        try:
+            if urlparse(aba.url).netloc != host or aba.locator(TELA_PROCESSO).filter(visible=True).count():
+                continue
+            seletor = localizar_lista(aba, timeout_ms=0)
+            if seletor:
+                achadas[aba] = tuple(extrair_numeros_pagina(aba, seletor))
+        except Exception:
+            pass  # a aba estava trocando de página ou foi fechada
+    return achadas
+
+
+def esperar_lista_do_usuario(page, ignorar_ja_abertas: bool = True):
+    """Espera, sem limite de tempo, você abrir no Chrome do robô a lista de processos do Relatório
+    de Sessão, e percebe sozinho quando ela aparece (sem tecla no terminal). Devolve a aba da lista.
+    Na 1ª vez (ignorar_ja_abertas) não vale uma lista que já estava na tela quando o robô começou a
+    esperar (ex.: na tela inicial). Ao reabrir a lista no meio da coleta vale qualquer uma: antes, a
+    lista que você reabria era igual à que já estava na tela e o robô ficava esperando para sempre.
+    Espera a lista ficar parada uns segundos, para pegar a lista já pronta (filtros aplicados)."""
     print("=" * 60)
     print("No Chrome do robô, abra a página do Relatório de Sessão com a lista de processos.")
-    print("Quando a lista aparecer, volte aqui e aperte Enter (o robô não mexe em nada antes disso).")
+    print("O robô começa sozinho quando a lista aparecer (ele não mexe em nada antes disso).")
     print("=" * 60)
-    host = urlparse(URL_SISTEMA).netloc
+    ja_estavam = set(listas_abertas(page).values()) if ignorar_ja_abertas else set()
+    candidata, vezes = None, 0
     while True:
-        try:
-            input("Lista aberta? Aperte Enter... ")
-        except EOFError:
-            raise SystemExit("Sem teclado para confirmar que a lista está aberta. Cancelado.")
+        novas = [(aba, nums) for aba, nums in listas_abertas(page).items() if nums not in ja_estavam]
         # A aba mais nova primeiro: se você abriu a lista numa aba nova, é ela.
-        for aba in reversed(page.context.pages):
-            if urlparse(aba.url).netloc == host and localizar_lista(aba, timeout_ms=3000):
+        atual = novas[-1] if novas else None
+        if atual and candidata and atual[1] == candidata[1]:
+            vezes += 1
+            if vezes >= 3:  # ~3 s sem mudar
+                aba = atual[0]
                 aba.bring_to_front()
+                print(f"Lista detectada ({len(atual[1])} processo(s) na página aberta). Começando.")
                 return aba
-        print("Não achei nenhuma lista de processos nas abas do e-SISREC. Abra a lista e aperte Enter "
-              "de novo (ou Ctrl+C para cancelar).")
+        else:
+            candidata, vezes = atual, 0
+        try:
+            page.wait_for_timeout(1000)  # chamada ao navegador, para a lista de abas se atualizar
+        except Exception:
+            time.sleep(1)  # a aba de referência foi fechada
+            page = next(iter(page.context.pages), page)
 
 
 def selecionar_unidade_se_preciso(page):
@@ -630,6 +739,36 @@ def voltar_pagina_inicial(page):
         page.wait_for_timeout(3000)
 
 
+def fechar_dialogos(page):
+    """Fecha as janelas abertas por cima da tela (o visualizador de PDF e, se um erro a deixou
+    aberta, a de anexar). Com elas abertas, a busca rápida e os botões da tela não recebem o clique."""
+    for _ in range(3):
+        try:
+            abertas = page.locator(".ui-dialog").filter(visible=True)
+            if not abertas.count():
+                return
+            fechar = abertas.last.locator(".ui-dialog-titlebar-close")
+            if fechar.count():
+                fechar.first.click(timeout=ESPERA_CURTA_MS)
+            else:
+                page.keyboard.press("Escape")
+        except Exception:
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+        page.wait_for_timeout(1000)
+    print("AVISO: não consegui fechar a janela aberta por cima da tela (visualizador de PDF?).")
+
+
+def busca_rapida_na_tela(page) -> bool:
+    """O campo de busca rápida está visível na tela atual (sem precisar ir à Página Inicial)?"""
+    try:
+        return page.locator("#formBuscaRapida\\:buscaRapida").filter(visible=True).count() > 0
+    except Exception:
+        return False
+
+
 def fazer_busca_processo(page, numero: str) -> bool:
     """Preenche a busca rápida com o número do processo e espera a tela do processo."""
     try:
@@ -638,6 +777,9 @@ def fazer_busca_processo(page, numero: str) -> bool:
         page.locator("#formBuscaRapida\\:btBuscaRapida").click()
         page.wait_for_selector("[id='formProcesso:incluirDocumentoRequerimento']",
                                state="visible", timeout=ESPERA_MS)
+        if not processo_na_tela(page, numero):
+            print(f"ERRO A busca abriu um processo, mas o número {numero} não aparece na tela.")
+            return False
         print(f"OK Carregou processo: {numero}")
         return True
     except Exception as e:
@@ -681,7 +823,10 @@ class AnexoIncerto(Exception):
 
 def gerar_pdf_da_arvore(page, tag: str):
     clicar(page.locator("[id='formProcesso:arvoreDocumental']"), "Clicou em 'Árvore Documental'", tag)
-    page.wait_for_timeout(3000)
+    # A árvore abre numa página nova que pode demorar bem mais que alguns segundos quando o
+    # sistema está lento: espera ela aparecer de verdade em vez de um tempo fixo.
+    page.wait_for_selector("[id='arvoreDocumentosForm']", state="visible", timeout=ESPERA_MS)
+    page.wait_for_timeout(1000)
 
     try:
         # Só a caixa da árvore de documentos (antes: a 1ª caixa da página inteira, que podia ser
@@ -694,7 +839,7 @@ def gerar_pdf_da_arvore(page, tag: str):
             caixa.click()
             print(f"OK [{tag}] Selecionar tudo")
     except Exception:
-        page.get_by_text("Selecionar tudo").click()
+        page.get_by_text("Selecionar tudo").click(timeout=ESPERA_MS)
         print(f"OK [{tag}] Selecionar tudo via texto")
     page.wait_for_timeout(3000)
 
@@ -702,7 +847,7 @@ def gerar_pdf_da_arvore(page, tag: str):
         clicar(page.locator("[id='arvoreDocumentosForm:btnGerarPdf']"), "Gerar PDF", tag,
                timeout=ESPERA_CURTA_MS)
     except Exception:
-        page.get_by_text("Gerar PDF").click()
+        page.get_by_text("Gerar PDF").click(timeout=ESPERA_MS)
         print(f"OK [{tag}] Gerar PDF via texto")
 
     print(f"[{tag}] Aguardando o visualizador de PDF...")
@@ -717,18 +862,24 @@ def aguardar_pdf_carregado(page, iframe, tag: str):
     try:
         paginas = iframe.locator("#numPages")
         paginas.wait_for(state="visible", timeout=ESPERA_PDF_MS)
+        # Antes eram só ~10 s fixos e, se o PDF não carregasse nesse tempo, seguia sem avisar e
+        # baixava um PDF pela metade (o download era cancelado). Agora espera até ESPERA_PDF_MS.
+        prazo = time.monotonic() + ESPERA_PDF_MS / 1000 if ESPERA_PDF_MS else None
         ultimo, estavel = "", 0
-        for _ in range(20):
+        while True:
             texto = paginas.inner_text()
             if texto != ultimo:
                 ultimo, estavel = texto, 0
             else:
                 estavel += 1
-            if estavel >= 2 and "de" in texto and len(texto) > 3:
-                achado = re.search(r"\d+", texto)
-                if achado and int(achado.group()) > 0:
-                    print(f"OK [{tag}] PDF carregado: {texto} páginas")
-                    break
+            achado = re.search(r"(?:de|of)\s*(\d+)", texto)
+            if estavel >= 2 and achado and int(achado.group(1)) > 0:
+                print(f"OK [{tag}] PDF carregado: {texto} páginas")
+                break
+            if prazo and time.monotonic() > prazo:
+                print(f"AVISO [{tag}] o PDF não terminou de carregar a tempo "
+                      f"(contador: '{texto}'); tentando baixar assim mesmo.")
+                break
             page.wait_for_timeout(500)
         page.wait_for_timeout(2000)
     except Exception as e:
@@ -739,32 +890,36 @@ def baixar_pdf(page, tag: str, destino: Path) -> bool:
     iframe = page.frame_locator(SELETOR_IFRAME_PDF)
     aguardar_pdf_carregado(page, iframe, tag)
 
-    try:
-        # O botão de download do visualizador (PDF.js) pode ficar escondido no menu ">>" quando a
-        # barra é estreita. Ctrl+- do Playwright não muda o zoom do navegador, então em vez disso:
-        # clica normalmente se o botão estiver visível; se não, dispara o clique direto nele.
-        botao = iframe.locator("#download, #downloadButton, #secondaryDownload").first
-        botao.wait_for(state="attached", timeout=ESPERA_MS)
-        with page.expect_download(timeout=ESPERA_PDF_MS) as info:
-            if botao.is_visible():
-                botao.click()
-            else:
-                botao.dispatch_event("click")
-        # Salva com outro nome e só renomeia no fim: um arquivo pela metade nunca fica
-        # com o nome final (senão a próxima execução acharia que ele já foi baixado).
-        temporario = destino.with_suffix(".pdf.part")
-        info.value.save_as(temporario)
-        with open(temporario, "rb") as f:
-            cabecalho = f.read(5)
-        if cabecalho != b"%PDF-":
-            temporario.unlink()  # fora do 'with': no Windows não dá para apagar um arquivo aberto
-            raise RuntimeError("o arquivo baixado não é um PDF")
-        temporario.replace(destino)
-        print(f"OK [{tag}] PDF baixado: {destino}")
-        return True
-    except Exception as e:
-        print(f"ERRO [{tag}] Falha no download: {e}")
-        return False
+    tentativas = 2  # com o sistema lento o download às vezes é cancelado; tenta mais uma vez
+    for tentativa in range(1, tentativas + 1):
+        try:
+            # O botão de download do visualizador (PDF.js) pode ficar escondido no menu ">>" quando a
+            # barra é estreita. Ctrl+- do Playwright não muda o zoom do navegador, então em vez disso:
+            # clica normalmente se o botão estiver visível; se não, dispara o clique direto nele.
+            botao = iframe.locator("#download, #downloadButton, #secondaryDownload").first
+            botao.wait_for(state="attached", timeout=ESPERA_MS)
+            with page.expect_download(timeout=ESPERA_PDF_MS) as info:
+                if botao.is_visible():
+                    botao.click()
+                else:
+                    botao.dispatch_event("click")
+            # Salva com outro nome e só renomeia no fim: um arquivo pela metade nunca fica
+            # com o nome final (senão a próxima execução acharia que ele já foi baixado).
+            temporario = destino.with_suffix(".pdf.part")
+            info.value.save_as(temporario)
+            with open(temporario, "rb") as f:
+                cabecalho = f.read(5)
+            if cabecalho != b"%PDF-":
+                temporario.unlink()  # fora do 'with': no Windows não dá para apagar um arquivo aberto
+                raise RuntimeError("o arquivo baixado não é um PDF")
+            temporario.replace(destino)
+            print(f"OK [{tag}] PDF baixado: {destino}")
+            return True
+        except Exception as e:
+            print(f"ERRO [{tag}] Falha no download (tentativa {tentativa}/{tentativas}): {e}")
+            if tentativa < tentativas:
+                page.wait_for_timeout(5000)
+    return False
 
 
 def processar_fluxo_processo(page, numero: str, destino: Path, log: "Log", ja_anexado: bool) -> str:
@@ -922,10 +1077,12 @@ def sistema_logado(navegador: str = "chrome"):
                 pass
 
 
-def etapa_coletar(navegador: str = "chrome", limite: int | None = None, lista: str = "sessao"):
+def etapa_coletar(navegador: str = "chrome", limite: int | None = None, lista: str = "sessao",
+                  processo: str | None = None):
     """limite: número máximo de processos em que o robô entra (anexa/baixa). Os que já têm PDF
     ou estão para conferir não contam, porque o robô não mexe neles.
-    lista: 'sessao' espera você abrir o Relatório de Sessão; 'relatar' abre a lista 'Relatar' sozinho."""
+    lista: 'sessao' espera você abrir o Relatório de Sessão; 'relatar' abre a lista 'Relatar' sozinho.
+    processo: se informado, só mexe nesse processo (ele precisa estar na lista)."""
     PASTA_PDF.mkdir(parents=True, exist_ok=True)
     log = Log(ARQ_LOG)
 
@@ -934,7 +1091,16 @@ def etapa_coletar(navegador: str = "chrome", limite: int | None = None, lista: s
             abrir_lista_relatar(page)
         else:
             page = esperar_lista_do_usuario(page)
+            # Você pode ter deixado a lista em outra página: conta sempre a partir da 1.
+            seletor = localizar_lista(page)
+            if not seletor or not ir_para_primeira_pagina(page, seletor):
+                raise SystemExit("Não consegui ir para a página 1 da lista. Nada foi anexado.")
         processos = coletar_todos_processos(page)
+        if processo:
+            processos = [(n, p) for n, p in processos if n == processo]
+            if not processos:
+                print(f"AVISO: o processo {processo} não está nessa lista. Encerrando a coleta.")
+                return
         if not processos:
             print("AVISO: nenhum processo encontrado. Encerrando a coleta.")
             return
@@ -944,24 +1110,25 @@ def etapa_coletar(navegador: str = "chrome", limite: int | None = None, lista: s
             seletor = localizar_lista(page)
             if not seletor or not ir_para_primeira_pagina(page, seletor):
                 raise SystemExit("Não consegui voltar para a página 1 da lista. Nada foi anexado.")
-            # Tela escolhida por você: confere a lista antes de anexar (anexar grava no sistema).
+            # Tela escolhida por você: mostra a lista e dá um tempo para cancelar antes de anexar
+            # (anexar grava no sistema).
             numeros = [n for n, _ in processos]
             amostra = (", ".join(numeros) if len(numeros) <= 5
                        else f"{', '.join(numeros[:3])} ... {', '.join(numeros[-2:])}")
             print(f"\nAchei {len(numeros)} processo(s) nessa lista: {amostra}")
-            try:
-                resposta = input(f"O robô vai anexar o documento e baixar o PDF desses processos"
-                                 f"{f' (no máximo {limite})' if limite else ''}. Continuar? (s/n) ")
-            except EOFError:
-                resposta = ""
-            if resposta.strip().lower() not in ("s", "sim"):
-                raise SystemExit("Cancelado. Nada foi anexado.")
+            print(f"O robô vai anexar o documento e baixar o PDF desses processos"
+                  f"{f' (no máximo {limite})' if limite else ''}. Começando em {ESPERA_CANCELAR_S} s; "
+                  f"para cancelar, aperte Ctrl+C agora.")
+            page.wait_for_timeout(ESPERA_CANCELAR_S * 1000)
 
         for numero, pagina in processos:
             log.adicionar(numero, pagina)
         log.salvar()
 
         trabalhados = 0
+        # Só o 1º processo é aberto pela lista; os outros, pela busca rápida (os números já foram
+        # lidos de todas as páginas). O 'voltar' do navegador não traz a lista de volta no e-SISREC.
+        pela_busca = False
         for idx, (numero, _) in enumerate(processos, 1):
             print(f"\n--- Processando {idx}/{len(processos)}: {numero} ---")
             destino = PASTA_PDF / f"{nome_arquivo(numero)}.pdf"
@@ -990,22 +1157,40 @@ def etapa_coletar(navegador: str = "chrome", limite: int | None = None, lista: s
             if lista == "relatar":
                 voltar_pagina_inicial(page)
                 aberto = fazer_busca_processo(page, numero)
+            elif pela_busca:
+                # Busca rápida da tela em que está; se ela não estiver na tela, pela Página Inicial.
+                fechar_dialogos(page)
+                if not busca_rapida_na_tela(page):
+                    voltar_pagina_inicial(page)
+                aberto = fazer_busca_processo(page, numero)
             else:
                 # Abre o processo pela própria lista (sem passar pela Página Inicial).
                 if not lista_na_tela(page, seletor, ESPERA_CURTA_MS):
                     print("AVISO: a lista do Relatório de Sessão não está na tela.")
-                    page = esperar_lista_do_usuario(page)
+                    page = esperar_lista_do_usuario(page, ignorar_ja_abertas=False)
                     seletor = localizar_lista(page)
                 aberto = abrir_processo_da_lista(page, seletor, numero)
+                if aberto == PAGINADOR_TRAVADO:
+                    # Depois do 'voltar', a lista às vezes vem da memória do navegador e o paginador
+                    # dela não responde mais. Com a lista aberta de novo por você, ele volta a funcionar.
+                    print("AVISO: não consegui trocar a página da lista que voltou do histórico. "
+                          "Abra a lista de novo (do jeito que abriu no começo).")
+                    page = esperar_lista_do_usuario(page, ignorar_ja_abertas=False)
+                    seletor = localizar_lista(page)
+                    aberto = abrir_processo_da_lista(page, seletor, numero) is True
             if not aberto:
                 log.atualizar(numero, STATUS_ERRO_PDF if ja_anexado else "Erro na busca")
+                if (lista != "relatar" and not pela_busca
+                        and page.locator(TELA_PROCESSO).filter(visible=True).count()):
+                    voltar_para_lista(page, seletor)  # abriu um processo, mas não o certo
                 continue
 
             log.atualizar(numero, processar_fluxo_processo(page, numero, destino, log, ja_anexado))
             page.wait_for_timeout(2000)
-            # Se o 'voltar' não trouxer a lista, o próximo processo pede para você abri-la de novo.
-            if lista != "relatar" and not voltar_para_lista(page, seletor):
-                print("AVISO: o 'voltar' do navegador não trouxe a lista de volta.")
+            fechar_dialogos(page)  # o visualizador de PDF fica aberto por cima da tela
+            if lista != "relatar" and not pela_busca:
+                pela_busca = True
+                print("Os próximos processos serão abertos pela busca rápida.")
 
         print(f"\nColeta terminada. PDFs em: {PASTA_PDF}")
         print(f"Planilha de controle: {ARQ_LOG}")
@@ -1048,7 +1233,7 @@ def paginas_sem_texto_no_txt(texto: str) -> list[int]:
     return paginas
 
 
-def etapa_converter():
+def etapa_converter(processo: str | None = None):
     try:
         import pymupdf
     except ImportError:  # versões antigas do PyMuPDF só têm o nome 'fitz'
@@ -1057,6 +1242,8 @@ def etapa_converter():
     PASTA_TEXTO.mkdir(parents=True, exist_ok=True)
     sem_texto, parciais = [], []
     pdfs = sorted(PASTA_PDF.glob("*.pdf"))
+    if processo:
+        pdfs = [p for p in pdfs if p.stem == nome_arquivo(processo)]
     print(f"{len(pdfs)} PDF(s) encontrados em {PASTA_PDF}")
 
     for pdf in pdfs:
@@ -1073,6 +1260,15 @@ def etapa_converter():
         except Exception as e:
             sem_texto.append({"id": pdf.stem, "motivo": f"erro ao abrir o PDF: {e}"})
             destino.unlink(missing_ok=True)  # não deixa um texto antigo valendo por este PDF
+            continue
+
+        # PDF certo no arquivo certo: o carimbo de cada página traz o número do processo.
+        carimbos = set(CARIMBO_NUMERO.findall("\n".join(t for t, _ in paginas)))
+        esperado = pdf.stem.replace("_", "/")
+        if carimbos and esperado not in carimbos:
+            sem_texto.append({"id": pdf.stem, "motivo": f"o carimbo do PDF é de outro processo "
+                                                        f"({', '.join(sorted(carimbos))}): conferir"})
+            destino.unlink(missing_ok=True)
             continue
 
         vazias = [i for i, (t, img) in enumerate(paginas, 1) if pagina_so_imagem(t, img)]
@@ -1095,7 +1291,11 @@ def etapa_converter():
         print(f"OK {pdf.stem}: {len(paginas)} páginas ({len(vazias)} só imagem), "
               f"{len(texto)} caracteres")
 
-    if sem_texto or parciais:
+    if processo:
+        # Só um processo: não regrava o relatório de PDFs sem texto (apagaria o dos outros).
+        for item in sem_texto + parciais:
+            print(f"AVISO: {json.dumps(item, ensure_ascii=False)}")
+    elif sem_texto or parciais:
         relatorio = {"sem_texto": sem_texto, "com_paginas_so_imagem": parciais}
         ARQ_SEM_TEXTO.write_text(json.dumps(relatorio, ensure_ascii=False, indent=2), encoding="utf-8")
         if sem_texto:
@@ -1143,8 +1343,16 @@ def separar_relatorios(texto: str, ids_esperados: set[str]) -> dict[str, str]:
         pid = normalizar_id(partes[i])
         corpo = partes[i + 1].strip()
         # Corpo vazio não é relatório: o processo fica faltando e é reenviado sozinho.
-        if corpo and pid in ids_esperados and pid not in encontrados:
-            encontrados[pid] = corpo
+        if not corpo or pid not in ids_esperados or pid in encontrados:
+            continue
+        # Relatório que cita OUTRO processo do mesmo grupo pode ter sido trocado pela IA:
+        # também fica faltando e é reenviado sozinho (sozinho não há com quem trocar).
+        citados = {nome_arquivo(n) for n in PADRAO_ID_PROCESSO.findall(corpo)} & (ids_esperados - {pid})
+        if citados:
+            print(f"AVISO: o relatório de {pid} cita outro processo do grupo ({', '.join(citados)}); "
+                  f"vou reenviá-lo sozinho.")
+            continue
+        encontrados[pid] = corpo
     return encontrados
 
 
@@ -1217,6 +1425,10 @@ def chamar_claude_code(lote: list[dict]) -> dict[str, str]:
     texto = saida.get("result") or ""
     if saida.get("is_error"):
         status = saida.get("api_error_status")
+        # Texto grande demais é problema só deste envio (a mensagem fala em "limit", mas não é o
+        # limite do plano): os outros processos continuam.
+        if re.search(r"too long|too large|context (window|length)|maximum context", texto, re.IGNORECASE):
+            raise RuntimeError(f"texto grande demais para a IA ({texto.strip()[:200]})")
         if status in STATUS_FATAIS or status == 429 or re.search(
                 r"limit|log ?in|logged|credit|crédito|autentica", texto, re.IGNORECASE):
             raise ErroFatalIA(texto or f"erro {status}")
@@ -1247,6 +1459,8 @@ def gerar_relatorios(chamar, lote: list[dict], salvar) -> dict[str, str]:
     except Exception as e:
         if erro_fatal(e):
             raise
+        if len(lote) == 1:  # reenviar sozinho seria repetir o mesmo envio
+            return {lote[0]["id"]: f"falha na chamada: {e}"}
         print(f"AVISO: o envio do grupo falhou ({e}). Tentando um processo por vez.")
 
     for item in [d for d in lote if d["id"] not in feitos]:
@@ -1347,7 +1561,8 @@ def markdown_para_docx(texto: str):
 
 
 def etapa_relatorios(confirmar: bool = True, ia: str = "claude", arq_prompt: Path = ARQ_PROMPT,
-                     arq_exemplo: Path = ARQ_EXEMPLO, lote: int | None = None):
+                     arq_exemplo: Path = ARQ_EXEMPLO, lote: int | None = None,
+                     processo: str | None = None):
     global INSTRUCAO_RELATORIO, TAMANHO_LOTE
     if lote:
         TAMANHO_LOTE = lote
@@ -1357,20 +1572,24 @@ def etapa_relatorios(confirmar: bool = True, ia: str = "claude", arq_prompt: Pat
     PASTA_RELATORIOS.mkdir(parents=True, exist_ok=True)
     itens, falhas = [], []
     for arq in sorted(PASTA_TEXTO.glob("*.txt")):
+        if processo and arq.stem != nome_arquivo(processo):
+            continue
         relatorio = PASTA_RELATORIOS / f"relatorio_{arq.stem}.docx"
         if relatorio.exists() and relatorio.stat().st_mtime >= arq.stat().st_mtime:
             continue  # já tem relatório, feito depois da última conversão do texto
         item = {"id": arq.stem, "texto": arq.read_text(encoding="utf-8")}
         if len(INSTRUCAO_RELATORIO) + tamanho_envio(item) > MAX_CARACTERES_ENVIO:
-            falhas.append({"id": arq.stem,
-                           "erro": f"texto com {len(item['texto'])} caracteres, acima do limite de envio "
-                                   f"({MAX_CARACTERES_ENVIO}); precisa ser dividido manualmente"})
-            continue
+            # Não descarta: vai sozinho num envio (montar_lotes faz isso). Se for grande demais
+            # para a IA, a falha fica registrada só para ele.
+            print(f"AVISO: {arq.stem} tem {len(item['texto'])} caracteres (acima de "
+                  f"{MAX_CARACTERES_ENVIO}); vai sozinho num envio.")
         itens.append(item)
 
     if not itens:
         print("Nenhum processo novo para gerar relatório.")
     else:
+        # Os grandes (que vão sozinhos) por último: no meio, eles separariam os pequenos em mais envios.
+        itens.sort(key=lambda it: len(INSTRUCAO_RELATORIO) + tamanho_envio(it) > MAX_CARACTERES_ENVIO)
         lotes = montar_lotes(itens)
         print(f"{len(itens)} processo(s) em {len(lotes)} envio(s) ao {nome_ia}.")
         if confirmar:
@@ -1384,6 +1603,13 @@ def etapa_relatorios(confirmar: bool = True, ia: str = "claude", arq_prompt: Pat
 
         def salvar_relatorio(pid: str, texto: str):
             doc = markdown_para_docx(texto)
+            # Número do processo no topo: a etapa 'enviar' confere se é o mesmo do processo que vai
+            # receber o texto. Fica antes do título RELATÓRIO, então não vai para o e-SISREC.
+            topo = f"Processo nº {pid.replace('_', '/')}"
+            if doc.paragraphs:
+                doc.paragraphs[0].insert_paragraph_before(topo)
+            else:
+                doc.add_paragraph(topo)
             destino = PASTA_RELATORIOS / f"relatorio_{pid}.docx"
             try:
                 doc.save(destino)
@@ -1401,18 +1627,22 @@ def etapa_relatorios(confirmar: bool = True, ia: str = "claude", arq_prompt: Pat
         except Exception as e:
             if not erro_fatal(e):
                 raise
-            salvar_falhas(falhas)
+            salvar_falhas(falhas, so_mostrar=bool(processo))
             dica = ("Se for o limite de uso do plano, espere ele renovar e rode de novo"
                     if ia == "claude" else "Verifique a chave e o saldo")
             raise SystemExit(f"Parando: o {nome_ia} recusou o envio ({e}). {dica}. "
                              f"Os relatórios já gerados foram mantidos e não serão refeitos.")
 
-    salvar_falhas(falhas)
+    salvar_falhas(falhas, so_mostrar=bool(processo))
     print(f"Relatórios em: {PASTA_RELATORIOS}")
 
 
-def salvar_falhas(falhas: list[dict]):
-    if falhas:
+def salvar_falhas(falhas: list[dict], so_mostrar: bool = False):
+    if so_mostrar:
+        # Rodando só um processo: não regrava o arquivo de falhas (apagaria as dos outros).
+        for falha in falhas:
+            print(f"AVISO: {falha['id']} sem relatório: {falha['erro']}")
+    elif falhas:
         ARQ_FALHAS.write_text(json.dumps(falhas, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"AVISO: {len(falhas)} processo(s) sem relatório, veja {ARQ_FALHAS}")
     elif ARQ_FALHAS.exists():
@@ -1445,8 +1675,7 @@ ESPERA_SALVAR_MS = 60_000
 
 STATUS_SALVO = "Salvo"
 STATUS_SALVO_INCERTO = "Salvo? O sistema não confirmou: conferir"
-STATUS_JA_TEM_TEXTO = "Conferir: o Relatório e Voto já tinha texto (não sobrescrevi)"
-STATUS_NAO_NEGA = "Conferir: o voto não conclui por negar provimento (não enviei)"
+STATUS_OUTRO_PROCESSO = "Conferir: o .docx cita outro número de processo e não este (não enviei)"
 STATUS_SEM_PARTES = "Conferir: o .docx não tem as partes RELATÓRIO, VOTO e EMENTA (não enviei)"
 
 
@@ -1580,12 +1809,15 @@ def marcar_opcao(escopo, rotulo: str, descricao: str):
     """Marca o botão de opção (PrimeFaces) que tem o texto 'rotulo', dentro de 'escopo'."""
     rotulos = escopo.locator("label").filter(
         has_text=re.compile(rf"^\s*{re.escape(rotulo)}\s*$", re.IGNORECASE))
-    try:  # algumas opções só aparecem depois de outra escolha (o sistema atualiza a tela)
-        rotulos.first.wait_for(state="visible", timeout=ESPERA_CURTA_MS)
+    try:  # algumas opções só aparecem depois de outra escolha (o sistema atualiza a tela, às vezes devagar)
+        rotulos.first.wait_for(state="visible", timeout=ESPERA_MS)
     except Exception:
         pass
     if rotulos.count() != 1:
-        raise RuntimeError(f"{descricao}: esperava 1 opção '{rotulo}' na tela, achei {rotulos.count()}")
+        # Mostra as opções que estão na tela, para saber se foi lentidão ou se o texto é outro.
+        na_tela = [t.strip() for t in escopo.locator("label").filter(visible=True).all_inner_texts() if t.strip()]
+        raise RuntimeError(f"{descricao}: esperava 1 opção '{rotulo}' na tela, achei {rotulos.count()}. "
+                           f"Opções na tela: {na_tela[:30]}")
     alvo = rotulos.first.get_attribute("for")
     if alvo:
         caixa = escopo.page.locator(f"[id='{alvo}']").locator(
@@ -1644,27 +1876,52 @@ def salvar_relatorio_voto(page) -> str:
     return STATUS_SALVO
 
 
-def enviar_processo(page, numero: str, secoes: dict[str, str]) -> str:
+def enviar_processo(page, numero: str, secoes: dict[str, str], nega: bool = True) -> str:
     """Abre o Relatório e Voto do processo, preenche, marca as opções e salva. Devolve o status."""
     voltar_pagina_inicial(page)
     if not fazer_busca_processo(page, numero):
         return "Erro na busca"
     abrir_relatorio_voto(page)
-    if any(texto_do_editor(page, id_campo) for id_campo in CAMPOS_TEXTO.values()):
-        return STATUS_JA_TEM_TEXTO
+    # O texto que já estiver na tela é substituído pelo gerado pela IA (a revisão é do advogado).
+    for parte, id_campo in CAMPOS_TEXTO.items():
+        antigo = texto_do_editor(page, id_campo)
+        if antigo:
+            print(f"[enviar] {parte.capitalize()} já tinha {len(antigo)} caracteres; vou substituir.")
     for parte, id_campo in CAMPOS_TEXTO.items():
         preencher_editor(page, id_campo, secoes[parte], parte.capitalize())
     grupo_alcada = page.locator("xpath=//*[text()[contains(., 'Alçada')]]"
                                 "/following::*[contains(@class,'ui-selectoneradio')][1]")
-    marcar_opcao(grupo_alcada, OPCAO_ALCADA, "Matéria de alçada")
     formulario = page.locator(f"[id='{FORM_VOTO}']")
-    marcar_opcao(formulario, OPCAO_DECISAO, "Decisão do relator")
-    marcar_opcao(formulario, OPCAO_TIPO_DECISAO, "Tipo de decisão")
-    marcar_tipo_objeto(page)
-    return salvar_relatorio_voto(page)
+    marcacoes = [("Matéria de alçada",
+                  lambda: marcar_opcao(grupo_alcada, OPCAO_ALCADA, "Matéria de alçada"))]
+    falhas = []
+    if nega:
+        marcacoes += [
+            ("Decisão do relator", lambda: marcar_opcao(formulario, OPCAO_DECISAO, "Decisão do relator")),
+            ("Tipo de decisão", lambda: marcar_opcao(formulario, OPCAO_TIPO_DECISAO, "Tipo de decisão")),
+        ]
+    else:
+        # As opções fixas são de negar provimento: marcá-las contradiria o voto.
+        print("AVISO [enviar] O voto não conclui por negar provimento: não marco a decisão "
+              "nem o tipo de decisão.")
+        falhas += ["Decisão do relator", "Tipo de decisão (voto não nega provimento)"]
+    marcacoes.append(("Tipo de objeto", lambda: marcar_tipo_objeto(page)))
+    # Uma marcação que falha não impede o salvamento: salva mesmo assim e o status diz o que
+    # conferir à mão. Como o status começa com "Salvo", o próximo 'enviar' não sobrescreve.
+    for nome, marcar in marcacoes:
+        try:
+            marcar()
+        except Exception as e:
+            print(f"AVISO [enviar] {str(e)[:300]}")
+            falhas.append(nome)
+    status = salvar_relatorio_voto(page)
+    if falhas:
+        status += f" - conferir: {', '.join(falhas)}"
+    return status
 
 
-def etapa_enviar(navegador: str = "chrome", limite: int | None = None, confirmar: bool = True):
+def etapa_enviar(navegador: str = "chrome", limite: int | None = None, confirmar: bool = True,
+                 processo: str | None = None):
     log = Log(ARQ_LOG_ENVIO)
     prontos = []
     for arq in sorted(PASTA_RELATORIOS.glob("relatorio_*.docx")):
@@ -1673,19 +1930,28 @@ def etapa_enviar(navegador: str = "chrome", limite: int | None = None, confirmar
         if not m:
             continue
         numero = f"{m.group(1)}/{m.group(2)}"
+        if processo and numero != processo:
+            continue
         if log.status(numero).startswith("Salvo"):
             continue  # já salvo (ou salvo sem confirmação, que precisa de conferência manual)
         log.adicionar(numero, "")
+        # Relatório certo no processo certo: se o .docx cita números de processo, este tem que estar
+        # entre eles (o arquivo pode ter sido renomeado ou a IA trocado os processos de um grupo).
+        citados = set(PADRAO_PROCESSO.findall(ler_texto_arquivo(arq)))
+        if citados and numero not in citados:
+            print(f"AVISO {numero}: {STATUS_OUTRO_PROCESSO} (cita: {', '.join(sorted(citados))})")
+            log.atualizar(numero, STATUS_OUTRO_PROCESSO)
+            continue
         secoes = docx_para_secoes(arq)
         if set(secoes) != set(CAMPOS_TEXTO):
             print(f"AVISO {numero}: {STATUS_SEM_PARTES}")
             log.atualizar(numero, STATUS_SEM_PARTES)
             continue
-        if not voto_nega_provimento(secoes["VOTO"]):
-            print(f"AVISO {numero}: {STATUS_NAO_NEGA}")
-            log.atualizar(numero, STATUS_NAO_NEGA)
-            continue
-        prontos.append((numero, secoes))
+        nega = voto_nega_provimento(secoes["VOTO"])
+        if not nega:
+            print(f"AVISO {numero}: o voto não conclui por negar provimento; envio o texto, mas a "
+                  f"decisão e o tipo de decisão ficam para marcar à mão.")
+        prontos.append((numero, secoes, nega))
     log.salvar()
 
     if limite:
@@ -1693,7 +1959,7 @@ def etapa_enviar(navegador: str = "chrome", limite: int | None = None, confirmar
     if not prontos:
         print(f"Nenhum processo para enviar. Veja {ARQ_LOG_ENVIO}")
         return
-    print(f"{len(prontos)} processo(s) para enviar: {', '.join(n for n, _ in prontos)}")
+    print(f"{len(prontos)} processo(s) para enviar: {', '.join(n for n, _, _ in prontos)}")
     if confirmar:
         try:
             resposta = input("O robô vai preencher e SALVAR o Relatório e Voto desses processos no "
@@ -1704,10 +1970,10 @@ def etapa_enviar(navegador: str = "chrome", limite: int | None = None, confirmar
             raise SystemExit("Cancelado.")
 
     with sistema_logado(navegador) as page:
-        for idx, (numero, secoes) in enumerate(prontos, 1):
+        for idx, (numero, secoes, nega) in enumerate(prontos, 1):
             print(f"\n--- Enviando {idx}/{len(prontos)}: {numero} ---")
             try:
-                status = enviar_processo(page, numero, secoes)
+                status = enviar_processo(page, numero, secoes, nega)
             except ErroAoSalvar as e:
                 status = f"Erro ao salvar: {e}"
             except Exception as e:
@@ -1744,26 +2010,34 @@ def main():
                     help=f"relatorios: processos por envio à IA (padrão: {TAMANHO_LOTE}). Se uma "
                          f"resposta vier cortada, os processos que faltaram são reenviados um a um")
     ap.add_argument("--lista", choices=["sessao", "relatar"], default="sessao",
-                    help="coletar: sessao (padrão): espera você abrir o Relatório de Sessão e apertar "
-                         "Enter; relatar: o robô abre sozinho a lista 'Relatar'")
+                    help="coletar: sessao (padrão): espera você abrir o Relatório de Sessão e começa "
+                         "sozinho quando a lista aparece; relatar: o robô abre sozinho a lista 'Relatar'")
     ap.add_argument("--limite", type=int, metavar="N",
                     help="coletar: mexe em no máximo N processos (anexar e baixar). Útil para testes")
+    ap.add_argument("--processo", metavar="NUMERO",
+                    help="todas as etapas: só esse processo (ex.: 44233.746869/2026-83). Útil para "
+                         "testes ou para refazer um processo")
     args = ap.parse_args()
     if args.limite is not None and args.limite < 1:
         ap.error("--limite precisa ser 1 ou mais")
+    if args.processo:
+        achado = PADRAO_ID_PROCESSO.fullmatch(args.processo.strip())
+        if not achado:
+            ap.error("--processo precisa ser no formato 12345.678901/2026-12")
+        args.processo = achado.group().replace("_", "/")
     if args.lote is not None and args.lote < 1:
         ap.error("--lote precisa ser 1 ou mais")
 
     if args.etapa in ("coletar", "tudo"):
-        etapa_coletar(args.navegador, args.limite, args.lista)
+        etapa_coletar(args.navegador, args.limite, args.lista, args.processo)
     if args.etapa in ("converter", "tudo"):
-        etapa_converter()
+        etapa_converter(args.processo)
     if args.etapa in ("relatorios", "tudo"):
         etapa_relatorios(confirmar=not args.sim, ia=args.ia, arq_prompt=args.prompt,
-                         arq_exemplo=args.exemplo, lote=args.lote)
+                         arq_exemplo=args.exemplo, lote=args.lote, processo=args.processo)
     if args.etapa == "enviar":
         # Sempre pergunta antes de salvar no sistema oficial (o --sim não vale para esta etapa).
-        etapa_enviar(args.navegador, args.limite, confirmar=True)
+        etapa_enviar(args.navegador, args.limite, confirmar=True, processo=args.processo)
 
 
 if __name__ == "__main__":
